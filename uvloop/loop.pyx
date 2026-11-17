@@ -40,7 +40,7 @@ from cpython cimport (
 )
 from cpython.pycapsule cimport PyCapsule_New, PyCapsule_GetPointer
 
-from . import _noop
+from . import _noop, _happy_eyeballs
 
 
 include "includes/stdlib.pxi"
@@ -1857,7 +1857,9 @@ cdef class Loop:
                                 family=0, proto=0, flags=0, sock=None,
                                 local_addr=None, server_hostname=None,
                                 ssl_handshake_timeout=None,
-                                ssl_shutdown_timeout=None):
+                                ssl_shutdown_timeout=None,
+                                happy_eyeballs_delay=None, interleave=None,
+                                all_errors=False):
         """Connect to a TCP server.
 
         Create a streaming transport connection to a given Internet host and
@@ -1889,6 +1891,42 @@ cdef class Loop:
             object app_transport
             object protocol
             object ssl_waiter
+
+        if (sock is None and (host is not None or port is not None)
+                and (happy_eyeballs_delay is not None or
+                     interleave is not None or all_errors)):
+            # Resolve and race *raw sockets* before constructing the
+            # application protocol. Only the winning socket is attached to
+            # libuv; a failed or cancelled attempt owns and closes its FD.
+            if server_hostname is not None and not ssl:
+                raise ValueError(
+                    'server_hostname is only meaningful with ssl')
+            if ssl_handshake_timeout is not None and not ssl:
+                raise ValueError(
+                    'ssl_handshake_timeout is only meaningful with ssl')
+            if ssl_shutdown_timeout is not None and not ssl:
+                raise ValueError(
+                    'ssl_shutdown_timeout is only meaningful with ssl')
+            if ssl and server_hostname is None:
+                if not host:
+                    raise ValueError('You must set server_hostname '
+                                     'when using ssl without a host')
+                server_hostname = host
+
+            connected_sock = await _happy_eyeballs._connect_socket(
+                self, host, port, family, proto, flags, local_addr,
+                happy_eyeballs_delay, interleave, all_errors)
+            try:
+                return await self.create_connection(
+                    protocol_factory, sock=connected_sock, ssl=ssl,
+                    server_hostname=server_hostname,
+                    ssl_handshake_timeout=ssl_handshake_timeout,
+                    ssl_shutdown_timeout=ssl_shutdown_timeout)
+            except BaseException:
+                # If a factory fails before libuv adopts the descriptor,
+                # the socket is still ours. A transferred FD is detached.
+                connected_sock.close()
+                raise
 
         if sock is not None and sock.family == uv.AF_UNIX:
             if host is not None or port is not None:
