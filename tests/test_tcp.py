@@ -1379,6 +1379,54 @@ class _TestSSL(tb.SSLTestCase):
     ONLYCERT = tb._cert_fullname(__file__, 'ssl_cert.pem')
     ONLYKEY = tb._cert_fullname(__file__, 'ssl_key.pem')
 
+    @unittest.skipUnless(
+        hasattr(asyncio, 'eager_task_factory'),
+        'eager task factory requires Python 3.12+',
+    )
+    def test_start_tls_eager_disconnect_before_handshake(self):
+        # A peer may disappear before an eagerly scheduled TLS upgrade
+        # starts. A pending handshake must never succeed with a dead socket.
+        sslctx = self._create_server_ssl_context(self.ONLYCERT,
+                                                  self.ONLYKEY)
+        loop = self.loop
+
+        async def check():
+            outcome = loop.create_future()
+
+            async def on_connection(reader, writer):
+                try:
+                    await writer.start_tls(sslctx)
+                except BaseException as exc:
+                    if not outcome.done():
+                        outcome.set_result(exc)
+                else:
+                    if not outcome.done():
+                        outcome.set_result(None)
+                finally:
+                    writer.close()
+
+            server = await asyncio.start_server(on_connection,
+                                                '127.0.0.1', 0)
+            try:
+                sock = socket.create_connection(
+                    server.sockets[0].getsockname())
+                sock.close()
+                exc = await asyncio.wait_for(outcome, 5)
+                self.assertIsInstance(exc, ConnectionResetError)
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        for eager in (False, True):
+            with self.subTest(eager=eager):
+                if eager:
+                    loop.set_task_factory(asyncio.eager_task_factory)
+                try:
+                    loop.run_until_complete(check())
+                finally:
+                    if eager:
+                        loop.set_task_factory(None)
+
     PAYLOAD_SIZE = 1024 * 100
     TIMEOUT = 60
 

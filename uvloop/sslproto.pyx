@@ -332,6 +332,13 @@ cdef class SSLProtocol:
         self._outgoing_read()
         self._conn_lost += 1
 
+        # A clean TCP EOF is not a successful TLS handshake. In particular,
+        # with eager tasks the peer can disconnect before connection_made()
+        # has even started the handshake. The pending waiter must fail rather
+        # than return a closed SSL transport to start_tls()/create_connection().
+        if self._waiter is not None and exc is None:
+            exc = ConnectionResetError('Connection lost during TLS handshake')
+
         # Just mark the app transport as closed so that its __dealloc__
         # doesn't complain.
         if self._app_transport is not None:
