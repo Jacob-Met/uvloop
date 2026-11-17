@@ -263,6 +263,7 @@ cdef class SSLProtocol:
         self._outgoing_read = self._outgoing.read
         self._state = UNWRAPPED
         self._conn_lost = 0  # Set when connection_lost called
+        self._eof_received = False
         if call_connection_made:
             self._app_state = STATE_INIT
         else:
@@ -397,13 +398,10 @@ cdef class SSLProtocol:
         self.buffer_updated_impl(nbytes)
 
     def eof_received(self):
-        """Called when the other end of the low-level stream
-        is half-closed.
-
-        If this returns a false value (including None), the transport
-        will close itself.  If it returns a true value, closing the
-        transport is up to the protocol.
+        """Called when the peer closes the underlying stream without TLS
+        close_notify. Drain authenticated plaintext before closing SSL.
         """
+        self._eof_received = True
         try:
             if self._loop.get_debug():
                 aio_logger.debug("%r received EOF", self)
@@ -411,17 +409,22 @@ cdef class SSLProtocol:
             if self._state == DO_HANDSHAKE:
                 self._on_handshake_complete(ConnectionResetError)
 
-            elif self._state == WRAPPED or self._state == FLUSHING:
-                # We treat a low-level EOF as a critical situation similar to a
-                # broken connection - just send whatever is in the buffer and
-                # close. No application level eof_received() is called -
-                # because we don't want the user to think that this is a
-                # graceful shutdown triggered by SSL "close_notify".
-                self._set_state(SHUTDOWN)
-                self._on_shutdown_complete(None)
+            elif self._state == WRAPPED:
+                # Keep the raw transport alive while application reads are
+                # paused.  Closing it now loses plaintext still in the BIO.
+                self._set_state(FLUSHING)
+                if not self._app_reading_paused:
+                    self._do_flush()
+                # _do_flush() itself may cause the app to pause again.
+                # Keep the raw transport open until that pause is lifted.
+                return self._state == FLUSHING
+
+            elif self._state == FLUSHING:
+                self._do_flush()
+                return self._state == FLUSHING
 
             elif self._state == SHUTDOWN:
-                self._on_shutdown_complete(None)
+                self._do_shutdown()
 
         except Exception:
             self._transport.close()
@@ -615,7 +618,35 @@ cdef class SSLProtocol:
         no application-level resume_writing() or pause_writing() will be called
         in FLUSHING, as we could fully manage the flow control internally.
         """
+        cdef Py_ssize_t pending_before, pending_after
         try:
+            if self._eof_received:
+                # A raw EOF must deliver authenticated plaintext before
+                # closing. Buffered protocols may only accept part of a TLS
+                # record in each callback.
+                pending_before = self._incoming.pending + self._sslobj_pending()
+                self._do_read()
+                if self._state != FLUSHING or self._app_reading_paused:
+                    return
+                pending_after = self._incoming.pending + self._sslobj_pending()
+                if pending_after:
+                    if pending_after >= pending_before:
+                        self._fatal_error(
+                            ConnectionResetError(
+                                "TLS peer closed with an incomplete record"))
+                    else:
+                        self._loop._call_soon_handle(
+                            new_MethodHandle(
+                                self._loop,
+                                "SSLProtocol._resume_after_peer_eof",
+                                <method_t>self._resume_after_peer_eof,
+                                context,
+                                self))
+                    return
+                self._set_state(SHUTDOWN)
+                self._do_shutdown(context)
+                return
+
             self._do_read_into_void(context)
             self._do_write()
             self._process_outgoing()
@@ -629,6 +660,11 @@ cdef class SSLProtocol:
 
     cdef _do_shutdown(self, object context=None):
         """Send close_notify and wait for the same from the peer."""
+        if self._eof_received:
+            # No peer bytes can arrive after a transport EOF, and unwrap()
+            # would otherwise wait forever for a missing close_notify.
+            self._on_shutdown_complete(None)
+            return
         try:
             # we must skip all application data (if any) before unwrap
             self._do_read_into_void(context)
@@ -654,6 +690,9 @@ cdef class SSLProtocol:
             self._fatal_error(shutdown_exc, 'Error occurred during shutdown')
         else:
             self._transport.close()
+
+    cdef inline _resume_after_peer_eof(self):
+        self._do_flush()
 
     cdef _abort(self, exc):
         self._set_state(UNWRAPPED)
@@ -714,7 +753,9 @@ cdef class SSLProtocol:
     # Incoming flow
 
     cdef _do_read(self):
-        if self._state != WRAPPED:
+        if self._state != WRAPPED and not (
+            self._state == FLUSHING and self._eof_received
+        ):
             return
         try:
             if not self._app_reading_paused:
@@ -942,11 +983,22 @@ cdef class SSLProtocol:
                                      <method_t>self._do_read,
                                      context,
                                      self))
+            elif self._state == FLUSHING and self._eof_received:
+                self._loop._call_soon_handle(
+                    new_MethodHandle(self._loop,
+                                     "SSLProtocol._resume_after_peer_eof",
+                                     <method_t>self._resume_after_peer_eof,
+                                     context,
+                                     self))
 
     # Flow control for reads from SSL socket
 
     cdef _control_ssl_reading(self):
-        cdef size_t size = self._get_read_buffer_size()
+        cdef size_t size
+        # libuv cannot safely restart reading after reporting UV_EOF.
+        if self._eof_received:
+            return
+        size = self._get_read_buffer_size()
         if size >= self._incoming_high_water and not self._ssl_reading_paused:
             self._ssl_reading_paused = True
             self._transport.pause_reading()

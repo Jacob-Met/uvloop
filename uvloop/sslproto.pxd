@@ -62,6 +62,7 @@ cdef class SSLProtocol:
         size_t _ssl_buffer_len
         SSLProtocolState _state
         size_t _conn_lost
+        bint _eof_received
         AppProtocolState _app_state
 
         bint _ssl_writing_paused
@@ -110,6 +111,7 @@ cdef class SSLProtocol:
     cdef inline _do_flush(self, object context=*)
     cdef inline _do_shutdown(self, object context=*)
     cdef inline _on_shutdown_complete(self, shutdown_exc)
+    cdef inline _resume_after_peer_eof(self)
     cdef inline _abort(self, exc)
 
     # Outgoing flow
