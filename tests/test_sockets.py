@@ -1,10 +1,12 @@
 import asyncio
+import contextvars
 import os
 import pickle
 import select
 import socket
 import time
 import unittest
+import weakref
 
 from uvloop import _testbase as tb
 
@@ -731,6 +733,66 @@ class TestUVSockets(_TestSockets, tb.UVTestCase):
             self.loop.remove_writer(s)
             s.close()
             self.assertEqual(s.fileno(), -1)
+
+    def test_socket_waiter_future_protocol_and_cancel_cleanup(self):
+        ctx = contextvars.ContextVar('socket_waiter_test', default='none')
+
+        async def run():
+            a, b = socket.socketpair()
+            with a, b:
+                a.setblocking(False)
+                b.setblocking(False)
+                task = self.loop.create_task(self.loop.sock_recv(b, 1))
+                await asyncio.sleep(0)
+                waiter = task._fut_waiter
+                self.assertIsNotNone(waiter)
+                self.assertTrue(asyncio.isfuture(waiter))
+                self.assertIs(weakref.ref(waiter)(), waiter)
+                self.assertIs(waiter.get_loop(), self.loop)
+                self.assertFalse(waiter.done())
+
+                contexts = []
+                token = ctx.set('registration-context')
+                waiter.add_done_callback(lambda f: contexts.append(ctx.get()))
+                ctx.reset(token)
+
+                task.cancel('socket operation cancelled')
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await asyncio.sleep(0)
+
+                self.assertTrue(waiter.done())
+                self.assertTrue(waiter.cancelled())
+                self.assertEqual(contexts, ['registration-context'])
+                self.assertFalse(self.loop.remove_reader(b))
+
+                # An old cancelled operation must not steal a fresh read.
+                a.send(b'q')
+                self.assertEqual(await self.loop.sock_recv(b, 1), b'q')
+
+        self.loop.run_until_complete(run())
+
+    def test_socket_waiter_future_completion_invariants(self):
+        async def run():
+            a, b = socket.socketpair()
+            with a, b:
+                a.setblocking(False)
+                b.setblocking(False)
+                task = self.loop.create_task(self.loop.sock_recv(b, 1))
+                await asyncio.sleep(0)
+                waiter = task._fut_waiter
+                self.assertIsNotNone(waiter)
+                self.assertFalse(waiter.done())
+                a.send(b'x')
+                self.assertEqual(await task, b'x')
+                self.assertTrue(waiter.done())
+                self.assertFalse(waiter.cancelled())
+                self.assertEqual(waiter.result(), b'x')
+                self.assertIsNone(waiter.exception())
+                self.assertFalse(waiter.cancel())
+                self.assertFalse(self.loop.remove_reader(b))
+
+        self.loop.run_until_complete(run())
 
 
 class TestAIOSockets(_TestSockets, tb.AIOTestCase):
