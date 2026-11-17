@@ -176,6 +176,9 @@ class Loop:
         server_hostname: Optional[str] = ...,
         ssl_handshake_timeout: Optional[float] = ...,
         ssl_shutdown_timeout: Optional[float] = ...,
+        happy_eyeballs_delay: Optional[float] = ...,
+        interleave: Optional[int] = ...,
+        all_errors: bool = ...,
     ) -> tuple[asyncio.BaseProtocol, _ProtocolT]: ...
     @overload
     async def create_connection(
@@ -193,6 +196,9 @@ class Loop:
         server_hostname: Optional[str] = ...,
         ssl_handshake_timeout: Optional[float] = ...,
         ssl_shutdown_timeout: Optional[float] = ...,
+        happy_eyeballs_delay: Optional[float] = ...,
+        interleave: Optional[int] = ...,
+        all_errors: bool = ...,
     ) -> tuple[asyncio.BaseProtocol, _ProtocolT]: ...
     async def create_unix_server(
         self,

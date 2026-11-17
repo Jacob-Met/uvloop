@@ -1,6 +1,7 @@
 # cython: language_level=3, embedsignature=True, freethreading_compatible=True
 
 import asyncio
+import asyncio.staggered
 cimport cython
 
 from .includes.debug cimport UVLOOP_DEBUG
@@ -63,6 +64,88 @@ cdef _is_sock_stream(sock_type):
         # https://github.com/torvalds/linux/blob/v4.13/include/linux/net.h#L77
         # for more details.
         return (sock_type & 0xF) == uv.SOCK_STREAM
+
+
+def _interleave_connection_addrinfos(addrinfos, first_family_count):
+    # RFC 8305: preserve resolver ordering within each address family.
+    families = {}
+    for info in addrinfos:
+        families.setdefault(info[0], []).append(info)
+    groups = list(families.values())
+    ordered = []
+    if first_family_count > 1:
+        ordered.extend(groups[0][:first_family_count - 1])
+        del groups[0][:first_family_count - 1]
+    while any(groups):
+        for group in groups:
+            if group:
+                ordered.append(group.pop(0))
+    return ordered
+
+
+cdef __connect_resolved_sock(Loop loop, sock, address):
+    # The address is already numeric getaddrinfo output: do not resolve it
+    # again in Loop.sock_connect() for every raced candidate.
+    return loop._sock_connect(sock, address)
+
+
+async def _race_connection_sockets(loop, remote_infos, local_infos,
+                                   delay, interleave, all_errors):
+    if interleave:
+        remote_infos = _interleave_connection_addrinfos(
+            remote_infos, interleave)
+
+    async def connect_one(info):
+        family, kind, proto, _, address = info
+        sock = socket_socket(family, kind, proto)
+        sock.setblocking(False)
+        try:
+            if local_infos is not None:
+                bind_errors = []
+                for local_family, _, _, _, local_address in local_infos:
+                    if local_family != family:
+                        continue
+                    try:
+                        sock.bind(local_address)
+                    except OSError as exc:
+                        bind_errors.append(exc)
+                    else:
+                        break
+                else:
+                    if bind_errors:
+                        raise bind_errors[-1]
+                    raise OSError('no local address for family {}'.format(
+                        family))
+            if isinstance(loop, Loop):
+                socket_inc_io_ref(sock)
+                try:
+                    fut = __connect_resolved_sock(loop, sock, address)
+                    if fut is not None:
+                        await fut
+                finally:
+                    socket_dec_io_ref(sock)
+            else:
+                # Accept loop doubles for deterministic cancellation tests.
+                await loop.sock_connect(sock, address)
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+    result, winner, failures = await asyncio.staggered.staggered_race(
+        (ft_partial(connect_one, info) for info in remote_infos),
+        delay, loop=loop)
+    if winner is not None:
+        return result
+
+    errors = [exc for exc in failures if exc is not None]
+    if all_errors and PY311:
+        raise ExceptionGroup('create_connection failed', errors)
+    if len(errors) == 1 or all(str(exc) == str(errors[0])
+                               for exc in errors):
+        raise errors[0]
+    raise OSError('Multiple exceptions: {}'.format(
+        ', '.join(str(exc) for exc in errors)))
 
 
 cdef _is_sock_dgram(sock_type):
@@ -1857,7 +1940,9 @@ cdef class Loop:
                                 family=0, proto=0, flags=0, sock=None,
                                 local_addr=None, server_hostname=None,
                                 ssl_handshake_timeout=None,
-                                ssl_shutdown_timeout=None):
+                                ssl_shutdown_timeout=None,
+                                happy_eyeballs_delay=None, interleave=None,
+                                all_errors=False):
         """Connect to a TCP server.
 
         Create a streaming transport connection to a given Internet host and
@@ -1897,6 +1982,62 @@ cdef class Loop:
             return await self.create_unix_connection(
                 protocol_factory, None,
                 sock=sock, ssl=ssl, server_hostname=server_hostname)
+
+        if happy_eyeballs_delay is not None and interleave is None:
+            interleave = 1
+
+        # Leave the original libuv transport path untouched unless the caller
+        # opts into address interleaving or staggered socket connections.
+        if ((happy_eyeballs_delay is not None or interleave) and
+                (host is not None or port is not None)):
+            if sock is not None:
+                raise ValueError(
+                    'host/port and sock can not be specified at the same time')
+            if ssl and server_hostname is None:
+                if not host:
+                    raise ValueError('You must set server_hostname '
+                                     'when using ssl without a host')
+                server_hostname = host
+            if server_hostname is not None and not ssl:
+                raise ValueError('server_hostname is only meaningful with ssl')
+            if ssl_handshake_timeout is not None and not ssl:
+                raise ValueError(
+                    'ssl_handshake_timeout is only meaningful with ssl')
+            if ssl_shutdown_timeout is not None and not ssl:
+                raise ValueError(
+                    'ssl_shutdown_timeout is only meaningful with ssl')
+
+            remote_infos = await self.getaddrinfo(
+                host, port, family=family, type=uv.SOCK_STREAM,
+                proto=proto, flags=flags)
+            if not remote_infos:
+                raise OSError('getaddrinfo() returned empty list')
+            if local_addr is not None:
+                if not isinstance(local_addr, (tuple, list)) or \
+                        len(local_addr) != 2:
+                    raise ValueError(
+                        'local_addr must be a tuple of host and port')
+                local_infos = await self.getaddrinfo(
+                    local_addr[0], local_addr[1], family=family,
+                    type=uv.SOCK_STREAM, proto=proto, flags=flags)
+                if not local_infos:
+                    raise OSError(
+                        'getaddrinfo() returned empty list for local_addr')
+            else:
+                local_infos = None
+
+            sock = await _race_connection_sockets(
+                self, remote_infos, local_infos, happy_eyeballs_delay,
+                interleave, all_errors)
+            try:
+                return await self.create_connection(
+                    protocol_factory, sock=sock, ssl=ssl,
+                    server_hostname=server_hostname,
+                    ssl_handshake_timeout=ssl_handshake_timeout,
+                    ssl_shutdown_timeout=ssl_shutdown_timeout)
+            except BaseException:
+                sock.close()
+                raise
 
         app_protocol = protocol = protocol_factory()
         ssl_waiter = None
@@ -2033,6 +2174,9 @@ cdef class Loop:
                 rai_iter = rai_iter.ai_next
 
             else:
+                if all_errors and PY311:
+                    raise ExceptionGroup(
+                        'create_connection failed', exceptions)
                 # If they all have the same str(), raise one.
                 model = str(exceptions[0])
                 if all(str(exc) == model for exc in exceptions):
